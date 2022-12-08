@@ -13,7 +13,7 @@ jobs:
   container:
     image: 'convisoappsec/flowcli'
   variables:
-    FLOW_PROJECT_CODE: '3qysm4zRpnk7Rnu-'
+    FLOW_PROJECT_CODE: 'fiyImy5pKqwXd_In'
 
   steps:
   - bash: |
