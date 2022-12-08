@@ -6,9 +6,6 @@
 trigger:
 - develop
 
-pool:
-  vmImage: ubuntu-latest
-
 jobs:
 - job: Conviso_Appsec_Sast
   pool:
