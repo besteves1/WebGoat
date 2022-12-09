@@ -89,7 +89,6 @@ class SpoofCookieAssignmentTest extends AssignmentEndpointTest {
     @DisplayName("Valid credentials login without authentication cookie")
     void validLoginWithoutCookieTest() throws Exception {
         String username = "webgoat";
-        String password = "webgoat";
 
         ResultActions result = mockMvc.perform(MockMvcRequestBuilders
             .post(LOGIN_CONTEXT_PATH)
