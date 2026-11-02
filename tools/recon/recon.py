@@ -20,6 +20,10 @@ Exemplos:
   python3 recon.py --target localhost
   python3 recon.py --target 127.0.0.1 --ports 8080,9090 --base-path /WebGoat
   python3 recon.py --target 10.0.0.5 --wordlist minha_lista.txt -o saida/
+
+Enumeração de subdomínios (modo separado):
+  python3 recon.py --target empresa.com.br --subdomains --passive-only
+  python3 recon.py --target empresa.com.br --subdomains --authorized --probe-http
 """
 
 from __future__ import annotations
@@ -340,6 +344,166 @@ def extract_links(body: str, base_url: str, host: str) -> list[str]:
     return sorted(links)[:200]
 
 
+# ------------------------------------------------- 8. Subdomain enumeration
+DEFAULT_SUBS = [
+    "www", "mail", "webmail", "smtp", "pop", "imap", "ftp", "sftp", "vpn",
+    "remote", "portal", "admin", "api", "api-dev", "dev", "develop", "test",
+    "qa", "uat", "stage", "staging", "hml", "homolog", "preprod", "prod",
+    "beta", "app", "apps", "m", "mobile", "static", "cdn", "assets", "img",
+    "auth", "sso", "login", "id", "accounts", "git", "gitlab", "jenkins",
+    "ci", "jira", "confluence", "wiki", "docs", "status", "monitor",
+    "grafana", "kibana", "elastic", "prometheus", "db", "mysql", "redis",
+    "intranet", "internal", "extranet", "owa", "autodiscover", "ns1", "ns2",
+    "mx", "blog", "shop", "store", "support", "help", "crm", "erp", "s3",
+    "backup", "old", "legacy", "demo", "sandbox", "k8s", "registry",
+]
+
+
+def crtsh_subdomains(domain: str, timeout: float) -> tuple[set[str], str | None]:
+    """Fonte passiva: Certificate Transparency via crt.sh."""
+    import urllib.request
+    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    data, last_err = None, None
+    for attempt in range(4):  # crt.sh é instável (502/503 frequentes)
+        try:
+            # Aqui a verificação TLS fica LIGADA (contexto padrão do sistema).
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode(errors="replace") or "[]")
+            break
+        except Exception as e:  # noqa: BLE001 - fonte externa, best-effort
+            last_err = str(e)
+            if attempt < 3:
+                log(f"  crt.sh: {last_err}; nova tentativa em {2 ** (attempt + 1)}s")
+                time.sleep(2 ** (attempt + 1))
+    if data is None:
+        return set(), last_err
+    names: set[str] = set()
+    for row in data:
+        for n in str(row.get("name_value", "")).splitlines():
+            n = n.strip().lower().lstrip("*.")
+            if n == domain or n.endswith("." + domain):
+                names.add(n)
+    return names, None
+
+
+def resolve_name(name: str) -> list[str]:
+    try:
+        return sorted({i[4][0] for i in socket.getaddrinfo(name, None)})
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+
+
+def enumerate_subdomains(domain: str, words: list[str], passive: bool,
+                         active: bool, workers: int, timeout: float,
+                         probe_http: bool) -> dict:
+    domain = domain.lower().strip(".")
+    sources: dict[str, set[str]] = {}
+    out: dict = {"domain": domain, "errors": {}}
+
+    if passive:
+        log(f"Consultando Certificate Transparency (crt.sh) para {domain} ...")
+        names, err = crtsh_subdomains(domain, max(timeout, 30))
+        if err:
+            out["errors"]["crt.sh"] = err
+            log(f"  crt.sh falhou: {err}")
+        else:
+            log(f"  {len(names)} nomes únicos em certificados")
+        for n in names:
+            sources.setdefault(n, set()).add("crt.sh")
+
+    wildcard_ips: set[str] = set()
+    if active:
+        probe = f"recon-wildcard-{int(time.time())}.{domain}"
+        wildcard_ips = set(resolve_name(probe))
+        if wildcard_ips:
+            log(f"  DNS wildcard detectado ({', '.join(wildcard_ips)}): "
+                "resultados com esses IPs serão descartados")
+        log(f"Brute force DNS com {len(words)} prefixos ...")
+        for w in words:
+            sources.setdefault(f"{w}.{domain}", set()).add("bruteforce")
+
+    log(f"Resolvendo {len(sources)} candidatos ...")
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(resolve_name, n): n for n in sources}
+        for f in cf.as_completed(futs):
+            name = futs[f]
+            ips = f.result()
+            only_brute = sources[name] == {"bruteforce"}
+            if not ips:
+                if not only_brute:  # nome histórico de CT que não resolve mais
+                    results.append({"name": name, "ips": [], "sources":
+                                    sorted(sources[name]), "resolves": False})
+                continue
+            if only_brute and wildcard_ips and set(ips) <= wildcard_ips:
+                continue
+            results.append({"name": name, "ips": ips,
+                            "sources": sorted(sources[name]), "resolves": True})
+
+    if probe_http:
+        live = [r for r in results if r["resolves"]]
+        log(f"Verificando HTTP/HTTPS em {len(live)} subdomínios ...")
+
+        def web(r: dict) -> None:
+            for scheme, port in (("https", 443), ("http", 80)):
+                try:
+                    resp = http_request(scheme, r["name"], port, "/", timeout)
+                except (OSError, http.client.HTTPException, ssl.SSLError):
+                    continue
+                hdr = {k.lower(): v for k, v in resp["headers"]}
+                r["http"] = {"url": f"{scheme}://{r['name']}/",
+                             "status": resp["status"],
+                             "title": title_of(resp["body"]),
+                             "server": hdr.get("server"),
+                             "location": hdr.get("location")}
+                return
+
+        with cf.ThreadPoolExecutor(max_workers=min(workers, 10)) as ex:
+            list(ex.map(web, live))
+
+    results.sort(key=lambda r: (not r["resolves"], r["name"]))
+    out["subdomains"] = results
+    out["wildcard_ips"] = sorted(wildcard_ips)
+    return out
+
+
+def write_subdomain_markdown(rep: dict, path: Path) -> None:
+    subs = rep["subdomains"]
+    live = [s for s in subs if s["resolves"]]
+    dead = [s for s in subs if not s["resolves"]]
+    L = [f"# Subdomínios: {rep['domain']}", "",
+         f"- Início: {rep['started']}",
+         f"- Duração: {rep['duration_s']}s",
+         f"- Resolvem: {len(live)} | Só em histórico de certificados: {len(dead)}"]
+    if rep.get("wildcard_ips"):
+        L.append(f"- DNS wildcard: {', '.join(rep['wildcard_ips'])}")
+    for src, err in rep.get("errors", {}).items():
+        L.append(f"- Erro em {src}: {err}")
+    has_http = any("http" in s for s in live)
+    L += ["", "## Ativos", ""]
+    if has_http:
+        L += ["| Subdomínio | IPs | Fontes | HTTP | Título / Server |",
+              "|---|---|---|---|---|"]
+    else:
+        L += ["| Subdomínio | IPs | Fontes |", "|---|---|---|"]
+    for s in live:
+        row = f"| `{s['name']}` | {', '.join(s['ips'][:3])} | {', '.join(s['sources'])} |"
+        if has_http:
+            h = s.get("http")
+            if h:
+                extra = h["title"] or h["server"] or (f"→ {h['location']}" if h["location"] else "-")
+                row += f" {h['status']} {h['url'].split(':')[0]} | {str(extra).replace('|', '/')} |"
+            else:
+                row += " - | - |"
+        L.append(row)
+    if dead:
+        L += ["", "## Não resolvem (vistos só em certificados)", ""]
+        L += [f"- `{s['name']}`" for s in dead[:300]]
+    L += ["", "---", "_Gerado por recon.py — uso autorizado apenas._", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
+
+
 # --------------------------------------------------------------- report
 def write_markdown(report: dict, path: Path) -> None:
     L = [f"# Recon: {report['target']}",
@@ -395,6 +559,52 @@ def write_markdown(report: dict, path: Path) -> None:
 
 
 # ----------------------------------------------------------------- main
+def run_subdomains(args: argparse.Namespace, domain: str, started: float) -> int:
+    try:
+        ipaddress.ip_address(domain)
+        log("--subdomains precisa de um domínio (ex.: empresa.com.br), não de um IP.")
+        return 2
+    except ValueError:
+        pass
+
+    active = not args.passive_only
+    # Brute force DNS e probe HTTP geram tráfego ativo para a infraestrutura
+    # do alvo; a consulta ao crt.sh é passiva (dados públicos de CT).
+    if (active or args.probe_http) and not args.authorized:
+        log("ABORTADO: brute force DNS / probe HTTP são técnicas ativas.")
+        log("Use --passive-only para só consultar Certificate Transparency, ou "
+            "--authorized se você tem autorização por escrito para este domínio.")
+        return 3
+
+    words = list(DEFAULT_SUBS)
+    if args.sub_wordlist:
+        words += [l.strip().lower() for l in Path(args.sub_wordlist).read_text().splitlines()
+                  if l.strip() and not l.startswith("#")]
+    words = list(dict.fromkeys(words))
+
+    rep = enumerate_subdomains(domain, words, passive=not args.no_passive,
+                               active=active, workers=args.workers,
+                               timeout=args.timeout, probe_http=args.probe_http)
+    rep["started"] = dt.datetime.fromtimestamp(started).isoformat(timespec="seconds")
+    rep["duration_s"] = round(time.time() - started, 1)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", domain)
+    jpath = out / f"subdomains-{safe}-{stamp}.json"
+    mpath = out / f"subdomains-{safe}-{stamp}.md"
+    jpath.write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_subdomain_markdown(rep, mpath)
+
+    live = sum(1 for s in rep["subdomains"] if s["resolves"])
+    log(f"Concluído em {rep['duration_s']}s: {live} subdomínios ativos, "
+        f"{len(rep['subdomains']) - live} só em histórico.")
+    log(f"Relatório: {mpath}")
+    log(f"JSON:      {jpath}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Recon leve de aplicações web (uso autorizado apenas).")
@@ -413,12 +623,25 @@ def main() -> int:
                     help="diretório de saída")
     ap.add_argument("--authorized", action="store_true",
                     help="confirmo que tenho autorização para testar um alvo público")
+    sub = ap.add_argument_group("enumeração de subdomínios")
+    sub.add_argument("--subdomains", action="store_true",
+                     help="enumera subdomínios de --target (um domínio) em vez do scan")
+    sub.add_argument("--sub-wordlist", help="prefixos extras para brute force DNS")
+    sub.add_argument("--passive-only", action="store_true",
+                     help="só fontes passivas (Certificate Transparency)")
+    sub.add_argument("--no-passive", action="store_true",
+                     help="não consulta crt.sh")
+    sub.add_argument("--probe-http", action="store_true",
+                     help="testa HTTP/HTTPS em cada subdomínio ativo (requer --authorized)")
     args = ap.parse_args()
 
     started = time.time()
     target = args.target.strip()
     if "://" in target:
         target = urlparse(target).hostname or target
+
+    if args.subdomains:
+        return run_subdomains(args, target, started)
 
     log(f"Resolvendo {target} ...")
     dns = resolve(target)
